@@ -1,0 +1,11 @@
+/
+/lost+found
+/searchdir
+/searchdir/A
+/searchdir/A/file2.txt
+/searchdir/B
+/searchdir/B/file3.txt
+/searchdir/B/file5.txt
+/searchdir/file1.txt
+/searchdir/file4.txt
+/searchdir/file6.txt
