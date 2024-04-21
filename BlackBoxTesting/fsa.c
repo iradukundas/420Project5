@@ -3,207 +3,95 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <string.h>
-#include <ext2fs/ext2fs.h>
+#include <linux/types.h>
+#include <ext2fs/ext2_fs.h>
+#include <sys/stat.h>
+#include <endian.h>
 
-#define EXT2_FT_REG_FILE 1
-#define EXT2_FT_DIR 2
+#define BASE_OFFSET 1024                   // Offset to the superblock from the start of the disk
+#define BLOCK_OFFSET(block) (BASE_OFFSET + (block - 1) * block_size)
 
-// Function declarations
-void print_general_info(struct ext2_super_block *sb, FILE *output);
-void print_group_info(int fd, struct ext2_super_block *sb, FILE *output);
-void print_root_entries(int fd, struct ext2_super_block *sb, FILE *output);
-void traverse_directory(int fd, struct ext2_super_block *sb, int inode_num, char *path, FILE *output);
+unsigned int block_size = 1024;            // Default block size is 1024 bytes
+
+void read_superblock(int fd, struct ext2_super_block *sb);
+void traverse_directory(int fd, struct ext2_super_block *sb, struct ext2_inode *inode, const char *path_prefix);
+void print_directory_contents(int fd, struct ext2_super_block *sb, struct ext2_inode *inode, const char *path_prefix);
 void print_file_content(int fd, struct ext2_super_block *sb, char *path, FILE *output);
 
 int main(int argc, char *argv[]) {
-    if (argc < 3) {
-        fprintf(stderr, "Usage: %s <diskname> <-option> [file_path]\n", argv[0]);
-        exit(1);
+    if (argc != 3) {
+        fprintf(stderr, "Usage: %s <disk_image_file> <option>\n", argv[0]);
+        exit(EXIT_FAILURE);
     }
 
-    char *diskname = argv[1];
-    char *option = argv[2];
-    FILE *output;
-    char output_file[256];
-
-    int fd = open(diskname, O_RDONLY);
+    int fd = open(argv[1], O_RDONLY);
     if (fd == -1) {
-        perror("Virtual disk open failed");
-        exit(1);
+        perror("Error opening disk image file");
+        exit(EXIT_FAILURE);
     }
 
-    struct ext2_super_block sb;
-    if (lseek(fd, 1024, SEEK_SET) != 1024 || read(fd, &sb, sizeof(sb)) != sizeof(sb)) {
-        perror("Failed to read superblock");
-        exit(1);
-    }
+    struct ext2_super_block super;
+    read_superblock(fd, &super);
 
-    sprintf(output_file, "%s_output.txt", option+1);  // Build the output filename from option
-    output = fopen(output_file, "w");
-    if (!output) {
-        perror("Failed to open output file");
-        close(fd);
-        exit(1);
-    }
-
-    if (strcmp(option, "-info") == 0) {
-        print_general_info(&sb, output);
-        print_group_info(fd, &sb, output);
-    } else if (strcmp(option, "-root") == 0) {
-        print_root_entries(fd, &sb, output);
-    } else if (strcmp(option, "-traverse") == 0) {
-        traverse_directory(fd, &sb, EXT2_ROOT_INO, "/", output);
-    } else if (strcmp(option, "-file") == 0 && argc == 4) {
-        print_file_content(fd, &sb, argv[3], output);
+    if (strcmp(argv[2], "-traverse") == 0) {
+        struct ext2_inode root_inode;
+        lseek(fd, BASE_OFFSET + super.s_inode_size * (EXT2_ROOT_INO - 1), SEEK_SET);
+        read(fd, &root_inode, sizeof(struct ext2_inode));
+        printf("Debug: Root inode mode: %o (expected directory mode: %o), raw mode: %x\n", root_inode.i_mode, S_IFDIR, root_inode.i_mode);
+        traverse_directory(fd, &super, &root_inode, "/");
     } else {
-        fprintf(stderr, "Invalid command or insufficient arguments\n");
+        fprintf(stderr, "Invalid option\n");
+        close(fd);
+        exit(EXIT_FAILURE);
     }
 
-    if (fclose(output) != 0) {
-        perror("Failed to close output file");
-    }
     close(fd);
-
     return 0;
 }
 
-void print_general_info(struct ext2_super_block *sb, FILE *output) {
-    fprintf(output, "--General File System Information--\n");
-    fprintf(output, "Block Size in Bytes: %u\n", 1024 << sb->s_log_block_size);
-    fprintf(output, "Total Number of Blocks: %u\n", sb->s_blocks_count);
-    fprintf(output, "Disk Size in Bytes: %llu\n", (unsigned long long)sb->s_blocks_count * (1024 << sb->s_log_block_size));
-    fprintf(output, "Maximum Number of Blocks Per Group: %u\n", sb->s_blocks_per_group);
-    fprintf(output, "Inode Size in Bytes: %u\n", sb->s_inode_size);
-    fprintf(output, "Number of Inodes Per Group: %u\n", sb->s_inodes_per_group);
-    fprintf(output, "Number of Inode Blocks Per Group: %u\n", (sb->s_inodes_per_group * sb->s_inode_size) / (1024 << sb->s_log_block_size));
-    fprintf(output, "Number of Groups: %u\n", (sb->s_blocks_count + sb->s_blocks_per_group - 1) / sb->s_blocks_per_group);
-
-    if (ferror(output)) {
-        perror("Error writing general info to output file");
+void read_superblock(int fd, struct ext2_super_block *sb) {
+    lseek(fd, BASE_OFFSET, SEEK_SET);
+    if (read(fd, sb, sizeof(struct ext2_super_block)) != sizeof(struct ext2_super_block)) {
+        fprintf(stderr, "Failed to read superblock\n");
+        exit(EXIT_FAILURE);
     }
+    block_size = 1024 << sb->s_log_block_size;
+    printf("Debug: Superblock - Magic: %x, Inodes count: %u, Block size: %u\n", sb->s_magic, sb->s_inodes_count, block_size);
 }
 
-void print_group_info(int fd, struct ext2_super_block *sb, FILE *output) {
-    unsigned int num_groups = (sb->s_blocks_count + sb->s_blocks_per_group - 1) / sb->s_blocks_per_group;
-    struct ext2_group_desc gd;
-    unsigned int group_size = sizeof(struct ext2_group_desc);
-
-    fprintf(output, "--Group Information--\n");
-    lseek(fd, 1024 + (1 * sb->s_log_block_size), SEEK_SET);  // Seek to the beginning of the group descriptor table
-
-    for (unsigned int i = 0; i < num_groups; i++) {
-        if (read(fd, &gd, group_size) != group_size) {
-            perror("Error reading group descriptor");
-            break;
-        }
-        fprintf(output, "Group %u: \n", i);
-        fprintf(output, "  Block Bitmap Block ID: %u\n", gd.bg_block_bitmap);
-        fprintf(output, "  Inode Bitmap Block ID: %u\n", gd.bg_inode_bitmap);
-        fprintf(output, "  Inode Table Block ID: %u\n", gd.bg_inode_table);
-        fprintf(output, "  Free Blocks Count: %u\n", gd.bg_free_blocks_count);
-        fprintf(output, "  Free Inodes Count: %u\n", gd.bg_free_inodes_count);
-        fprintf(output, "  Used Directories Count: %u\n", gd.bg_used_dirs_count);
-
-        if (ferror(output)) {
-            perror("Error writing group info to output file");
-            break;
-        }
+void traverse_directory(int fd, struct ext2_super_block *sb, struct ext2_inode *inode, const char *path_prefix) {
+    if ((inode->i_mode & S_IFMT) != S_IFDIR) {
+        fprintf(stderr, "Not a directory: %s, mode: %o (mask: %o), raw mode: %x\n", path_prefix, inode->i_mode, S_IFMT, inode->i_mode);
+        return;
     }
+    print_directory_contents(fd, sb, inode, path_prefix);
 }
 
-void print_root_entries(int fd, struct ext2_super_block *sb, FILE *output) {
-    struct ext2_inode inode;
+void print_directory_contents(int fd, struct ext2_super_block *sb, struct ext2_inode *inode, const char *path_prefix) {
+    unsigned char block[block_size];
     struct ext2_dir_entry_2 *entry;
-    unsigned int inode_table_block = sb->s_first_data_block + 1; // Inode table block immediately follows the superblock and group descriptor
-    unsigned int size = sizeof(struct ext2_inode);
+    int i = 0;
 
-    lseek(fd, inode_table_block * sb->s_log_block_size + 2 * size, SEEK_SET); // Inode 2 is the root inode
-    if (read(fd, &inode, size) != size) {
-        perror("Error reading root inode");
-        return;
-    }
+    while (i < 12 && inode->i_block[i]) {
+        lseek(fd, BLOCK_OFFSET(inode->i_block[i]), SEEK_SET);
+        read(fd, block, block_size);
 
-    char block[sb->s_log_block_size];
-    lseek(fd, inode.i_block[0] * sb->s_log_block_size, SEEK_SET);
-    if (read(fd, block, sb->s_log_block_size) != sb->s_log_block_size) {
-        perror("Error reading root directory block");
-        return;
-    }
+        for (entry = (struct ext2_dir_entry_2 *)block; (char *)entry < (char *)block + block_size; entry = (struct ext2_dir_entry_2 *)((char *)entry + entry->rec_len)) {
+            char file_name[EXT2_NAME_LEN + 1];
+            memcpy(file_name, entry->name, entry->name_len);
+            file_name[entry->name_len] = '\0';
 
-    fprintf(output, "--Root Directory Entries--\n");
-    for (int offset = 0; offset < sb->s_log_block_size; offset += entry->rec_len) {
-        entry = (struct ext2_dir_entry_2 *)(block + offset);
-        fprintf(output, "  Inode: %u, Rec_len: %u, Name_len: %u, Type: %u, Name: %.*s\n",
-                entry->inode, entry->rec_len, entry->name_len, entry->file_type, entry->name_len, entry->name);
+            char new_path[1024];
+            snprintf(new_path, sizeof(new_path), "%s/%s", path_prefix, file_name);
+            printf("%s (type %d)\n", new_path, entry->file_type);
 
-        if (ferror(output)) {
-            perror("Error writing root entries to output file");
-            break;
-        }
-    }
-}
-
-void traverse_directory(int fd, struct ext2_super_block *sb, int inode_num, char *path, FILE *output) {
-    struct ext2_inode inode;
-    struct ext2_dir_entry_2 *entry;
-    char block[sb->s_log_block_size];
-
-    lseek(fd, ((inode_num - 1) / sb->s_inodes_per_group) * sb->s_log_block_size + ((inode_num - 1) % sb->s_inodes_per_group) * sizeof(struct ext2_inode), SEEK_SET);
-    if (read(fd, &inode, sizeof(struct ext2_inode)) != sizeof(struct ext2_inode)) {
-        perror("Error reading inode");
-        return;
-    }
-
-    for (int i = 0; i < 12; i++) {  // Only direct blocks are considered
-        if (inode.i_block[i] == 0) continue;
-        lseek(fd, inode.i_block[i] * sb->s_log_block_size, SEEK_SET);
-        if (read(fd, block, sb->s_log_block_size) != sb->s_log_block_size) {
-            perror("Error reading directory block");
-            continue;
-        }
-
-        for (int offset = 0; offset < sb->s_log_block_size; offset += entry->rec_len) {
-            entry = (struct ext2_dir_entry_2 *)(block + offset);
-            if (entry->inode != 0) {
-                fprintf(output, "%s/%.*s\n", path, entry->name_len, entry->name);
-                if (ferror(output)) {
-                    perror("Error writing directory entry to output file");
-                    return;
-                }
-
-                if (entry->file_type == EXT2_FT_DIR && entry->name[0] != '.') { // Skip '.' and '..'
-                    char new_path[1024];
-                    snprintf(new_path, sizeof(new_path), "%s/%.*s", path, entry->name_len, entry->name);
-                    traverse_directory(fd, sb, entry->inode, new_path, output);
-                }
+            if (entry->file_type == EXT2_FT_DIR && strcmp(file_name, ".") != 0 && strcmp(file_name, "..") != 0) {
+                struct ext2_inode new_inode;
+                lseek(fd, BASE_OFFSET + sb->s_inode_size * (entry->inode - 1), SEEK_SET);
+                read(fd, &new_inode, sizeof(struct ext2_inode));
+                print_directory_contents(fd, sb, &new_inode, new_path);
             }
         }
-    }
-}
-
-void print_file_content(int fd, struct ext2_super_block *sb, char *path, FILE *output) {
-    // Simplification for brevity: Assume path directly leads to an inode number for demonstration
-    struct ext2_inode inode;
-    char block[sb->s_log_block_size];
-    int inode_num = atoi(path);  // Mock example, replace with actual path resolution logic
-
-    lseek(fd, ((inode_num - 1) / sb->s_inodes_per_group) * sb->s_log_block_size + ((inode_num - 1) % sb->s_inodes_per_group) * sizeof(struct ext2_inode), SEEK_SET);
-    if (read(fd, &inode, sizeof(struct ext2_inode)) != sizeof(struct ext2_inode)) {
-        perror("Error reading inode");
-        return;
-    }
-
-    for (int i = 0; i < 12; i++) {  // Only direct blocks are considered
-        if (inode.i_block[i] == 0) continue;
-        lseek(fd, inode.i_block[i] * sb->s_log_block_size, SEEK_SET);
-        ssize_t bytes_read = read(fd, block, sb->s_log_block_size);
-        if (bytes_read < 0) {
-            perror("Error reading file block");
-            continue;
-        }
-        if (fwrite(block, 1, bytes_read, output) != bytes_read) {
-            perror("Error writing file content to output file");
-            return;
-        }
+        i++;
     }
 }
