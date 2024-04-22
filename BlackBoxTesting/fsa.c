@@ -6,17 +6,16 @@
 #include <linux/types.h>
 #include <ext2fs/ext2_fs.h>
 #include <sys/stat.h>
-#include <endian.h>
 
-#define BASE_OFFSET 1024                   // Offset to the superblock from the start of the disk
-#define BLOCK_OFFSET(block) (BASE_OFFSET + (block - 1) * block_size)
+#define BASE_OFFSET 1024 // Offset to the superblock from the start of the disk
+#define BLOCK_OFFSET(block) (BASE_OFFSET + (block) * block_size)
 
-unsigned int block_size = 1024;            // Default block size is 1024 bytes
+unsigned int block_size; // Block size initialized from superblock
 
 void read_superblock(int fd, struct ext2_super_block *sb);
-void traverse_directory(int fd, struct ext2_super_block *sb, struct ext2_inode *inode, const char *path_prefix);
-void print_directory_contents(int fd, struct ext2_super_block *sb, struct ext2_inode *inode, const char *path_prefix);
-void print_file_content(int fd, struct ext2_super_block *sb, char *path, FILE *output);
+void print_general_info(int fd, struct ext2_super_block *sb, FILE *output);
+void print_group_info(int fd, struct ext2_super_block *sb, FILE *output);
+void print_root_entries(int fd, struct ext2_super_block *sb, FILE *output);
 
 int main(int argc, char *argv[]) {
     if (argc != 3) {
@@ -33,18 +32,37 @@ int main(int argc, char *argv[]) {
     struct ext2_super_block super;
     read_superblock(fd, &super);
 
-    if (strcmp(argv[2], "-traverse") == 0) {
-        struct ext2_inode root_inode;
-        lseek(fd, BASE_OFFSET + super.s_inode_size * (EXT2_ROOT_INO - 1), SEEK_SET);
-        read(fd, &root_inode, sizeof(struct ext2_inode));
-        printf("Debug: Root inode mode: %o (expected directory mode: %o), raw mode: %x\n", root_inode.i_mode, S_IFDIR, root_inode.i_mode);
-        traverse_directory(fd, &super, &root_inode, "/");
+    FILE *output = NULL;
+    char output_file[256];
+
+    if (strcmp(argv[2], "-info") == 0) {
+        snprintf(output_file, sizeof(output_file), "info_output.txt");
+        output = fopen(output_file, "w");
+        if (output == NULL) {
+            perror("Error opening output file");
+            close(fd);
+            exit(EXIT_FAILURE);
+        }
+        print_general_info(fd, &super, output);
+        print_group_info(fd, &super, output);
+    } else if (strcmp(argv[2], "-root") == 0) {
+        snprintf(output_file, sizeof(output_file), "root_output.txt");
+        output = fopen(output_file, "w");
+        if (output == NULL) {
+            perror("Error opening output file");
+            close(fd);
+            exit(EXIT_FAILURE);
+        }
+        print_root_entries(fd, &super, output);
     } else {
         fprintf(stderr, "Invalid option\n");
         close(fd);
         exit(EXIT_FAILURE);
     }
 
+    if (output != NULL) {
+        fclose(output);
+    }
     close(fd);
     return 0;
 }
@@ -55,43 +73,78 @@ void read_superblock(int fd, struct ext2_super_block *sb) {
         fprintf(stderr, "Failed to read superblock\n");
         exit(EXIT_FAILURE);
     }
-    block_size = 1024 << sb->s_log_block_size;
-    printf("Debug: Superblock - Magic: %x, Inodes count: %u, Block size: %u\n", sb->s_magic, sb->s_inodes_count, block_size);
+    block_size = 1024 << sb->s_log_block_size; // Calculate block size
 }
 
-void traverse_directory(int fd, struct ext2_super_block *sb, struct ext2_inode *inode, const char *path_prefix) {
-    if ((inode->i_mode & S_IFMT) != S_IFDIR) {
-        fprintf(stderr, "Not a directory: %s, mode: %o (mask: %o), raw mode: %x\n", path_prefix, inode->i_mode, S_IFMT, inode->i_mode);
+void print_general_info(int fd, struct ext2_super_block *sb, FILE *output) {
+    fprintf(output, "--General File System Information--\n");
+    fprintf(output, "Block Size in Bytes: %u\n", block_size);
+    fprintf(output, "Total Number of Blocks: %u\n", sb->s_blocks_count);
+    fprintf(output, "Disk Size in Bytes: %llu\n", (unsigned long long)sb->s_blocks_count * block_size);
+    fprintf(output, "Maximum Number of Blocks Per Group: %u\n", sb->s_blocks_per_group);
+    fprintf(output, "Inode Size in Bytes: %u\n", sb->s_inode_size);
+    fprintf(output, "Number of Inodes Per Group: %u\n", sb->s_inodes_per_group);
+    fprintf(output, "Number of Inode Blocks Per Group: %u\n", (sb->s_inodes_per_group * sb->s_inode_size) / block_size);
+    fprintf(output, "Number of Groups: %u\n", (sb->s_blocks_count + sb->s_blocks_per_group - 1) / sb->s_blocks_per_group);
+}
+
+void print_group_info(int fd, struct ext2_super_block *sb, FILE *output) {
+    struct ext2_group_desc gd;
+    unsigned int num_groups = (sb->s_blocks_count + sb->s_blocks_per_group - 1) / sb->s_blocks_per_group;
+
+    fprintf(output, "--Individual Group Information--\n");
+    for (unsigned int i = 0; i < num_groups; i++) {
+        lseek(fd, BLOCK_OFFSET(1) + i * sizeof(struct ext2_group_desc), SEEK_SET);
+        if (read(fd, &gd, sizeof(struct ext2_group_desc)) != sizeof(struct ext2_group_desc)) {
+            fprintf(stderr, "Error reading group descriptor %u\n", i);
+            continue;
+        }
+
+        fprintf(output, "-Group %u-\n", i);
+        fprintf(output, "Block IDs: %u-%u\n", i * sb->s_blocks_per_group + sb->s_first_data_block,
+                (i == num_groups - 1) ? sb->s_blocks_count - 1 : (i + 1) * sb->s_blocks_per_group - 1);
+        fprintf(output, "Block Bitmap Block ID: %u\n", gd.bg_block_bitmap);
+        fprintf(output, "Inode Bitmap Block ID: %u\n", gd.bg_inode_bitmap);
+        fprintf(output, "Inode Table Block ID: %u\n", gd.bg_inode_table);
+        fprintf(output, "Number of Free Blocks: %u\n", gd.bg_free_blocks_count);
+        fprintf(output, "Number of Free Inodes: %u\n", gd.bg_free_inodes_count);
+        fprintf(output, "Number of Directories: %u\n", gd.bg_used_dirs_count);
+
+        // Print free block IDs and free inode IDs
+        // Implement the logic to read the block bitmap and inode bitmap
+        // and print the free block IDs and free inode IDs as ranges
+
+        fprintf(output, "Free Block IDs: ...\n");
+        fprintf(output, "Free Inode IDs: ...\n");
+    }
+}
+
+void print_root_entries(int fd, struct ext2_super_block *sb, FILE *output) {
+    struct ext2_inode inode;
+    lseek(fd, BLOCK_OFFSET(sb->s_first_data_block) + (EXT2_ROOT_INO - 1) * sb->s_inode_size, SEEK_SET);
+    if (read(fd, &inode, sizeof(inode)) != sizeof(inode)) {
+        fprintf(stderr, "Error reading root inode\n");
         return;
     }
-    print_directory_contents(fd, sb, inode, path_prefix);
-}
 
-void print_directory_contents(int fd, struct ext2_super_block *sb, struct ext2_inode *inode, const char *path_prefix) {
     unsigned char block[block_size];
-    struct ext2_dir_entry_2 *entry;
-    int i = 0;
-
-    while (i < 12 && inode->i_block[i]) {
-        lseek(fd, BLOCK_OFFSET(inode->i_block[i]), SEEK_SET);
-        read(fd, block, block_size);
-
-        for (entry = (struct ext2_dir_entry_2 *)block; (char *)entry < (char *)block + block_size; entry = (struct ext2_dir_entry_2 *)((char *)entry + entry->rec_len)) {
-            char file_name[EXT2_NAME_LEN + 1];
-            memcpy(file_name, entry->name, entry->name_len);
-            file_name[entry->name_len] = '\0';
-
-            char new_path[1024];
-            snprintf(new_path, sizeof(new_path), "%s/%s", path_prefix, file_name);
-            printf("%s (type %d)\n", new_path, entry->file_type);
-
-            if (entry->file_type == EXT2_FT_DIR && strcmp(file_name, ".") != 0 && strcmp(file_name, "..") != 0) {
-                struct ext2_inode new_inode;
-                lseek(fd, BASE_OFFSET + sb->s_inode_size * (entry->inode - 1), SEEK_SET);
-                read(fd, &new_inode, sizeof(struct ext2_inode));
-                print_directory_contents(fd, sb, &new_inode, new_path);
-            }
-        }
-        i++;
+    lseek(fd, BLOCK_OFFSET(inode.i_block[0]), SEEK_SET);
+    if (read(fd, block, block_size) != block_size) {
+        fprintf(stderr, "Error reading root directory block\n");
+        return;
     }
+
+    fprintf(output, "--Root Directory Entries--\n");
+    struct ext2_dir_entry_2 *entry = (struct ext2_dir_entry_2 *)block;
+    int count = 0;
+    while ((char *)entry < (char *)block + block_size && count < 100) {
+        fprintf(output, "Inode: %u\n", entry->inode);
+        fprintf(output, "Entry Length: %u\n", entry->rec_len);
+        fprintf(output, "Name Length: %u\n", entry->name_len);
+        fprintf(output, "File Type: %u\n", entry->file_type);
+        fprintf(output, "Name: %.*s\n", entry->name_len, entry->name);
+        entry = (struct ext2_dir_entry_2 *)((char *)entry + entry->rec_len);
+        count++;
+    }
+    fprintf(output, "Number of entries processed: %d\n", count);
 }
