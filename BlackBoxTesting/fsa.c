@@ -121,11 +121,18 @@ void print_group_info(int fd, struct ext2_super_block *sb, FILE *output) {
 
 void print_root_entries(int fd, struct ext2_super_block *sb, FILE *output) {
     struct ext2_inode inode;
-    lseek(fd, BLOCK_OFFSET(sb->s_first_data_block) + (EXT2_ROOT_INO - 1) * sb->s_inode_size, SEEK_SET);
+    off_t offset = BLOCK_OFFSET(sb->s_first_data_block) + (EXT2_ROOT_INO - 1) * sb->s_inode_size;
+    fprintf(stderr, "Root inode offset: %lu\n", offset);
+    
+    lseek(fd, offset, SEEK_SET);
     if (read(fd, &inode, sizeof(inode)) != sizeof(inode)) {
         fprintf(stderr, "Error reading root inode\n");
         return;
     }
+
+    fprintf(stderr, "Root inode size: %u\n", inode.i_size);
+    fprintf(stderr, "Root inode blocks: %u\n", inode.i_blocks);
+    fprintf(stderr, "Root inode block[0]: %u\n", inode.i_block[0]);
 
     unsigned char block[block_size];
     lseek(fd, BLOCK_OFFSET(inode.i_block[0]), SEEK_SET);
@@ -137,14 +144,31 @@ void print_root_entries(int fd, struct ext2_super_block *sb, FILE *output) {
     fprintf(output, "--Root Directory Entries--\n");
     struct ext2_dir_entry_2 *entry = (struct ext2_dir_entry_2 *)block;
     int count = 0;
-    while ((char *)entry < (char *)block + block_size && count < 100) {
-        fprintf(output, "Inode: %u\n", entry->inode);
-        fprintf(output, "Entry Length: %u\n", entry->rec_len);
-        fprintf(output, "Name Length: %u\n", entry->name_len);
-        fprintf(output, "File Type: %u\n", entry->file_type);
-        fprintf(output, "Name: %.*s\n", entry->name_len, entry->name);
+    while ((char *)entry < (char *)block + block_size) {
+        fprintf(stderr, "Entry offset: %ld\n", (char *)entry - (char *)block);
+        fprintf(stderr, "rec_len: %u\n", entry->rec_len);
+        fprintf(stderr, "name_len: %u\n", entry->name_len);
+        fprintf(stderr, "file_type: %u\n", entry->file_type);
+        fprintf(stderr, "inode: %u\n", entry->inode);
+        fprintf(stderr, "name: %.*s\n", entry->name_len, entry->name);
+
+        if (entry->rec_len == 0) {
+            fprintf(stderr, "Invalid directory entry: rec_len is zero. Skipping entry.\n");
+            entry = (struct ext2_dir_entry_2 *)((char *)entry + sizeof(struct ext2_dir_entry_2));
+            continue;
+        }
+
+        if (entry->inode != 0) {
+            fprintf(output, "Inode: %u\n", entry->inode);
+            fprintf(output, "Entry Length: %u\n", entry->rec_len);
+            fprintf(output, "Name Length: %u\n", entry->name_len);
+            fprintf(output, "File Type: %u\n", entry->file_type);
+            fprintf(output, "Name: %.*s\n", entry->name_len, entry->name);
+            count++;
+        }
+
         entry = (struct ext2_dir_entry_2 *)((char *)entry + entry->rec_len);
-        count++;
     }
+
     fprintf(output, "Number of entries processed: %d\n", count);
 }
