@@ -7,10 +7,10 @@
 #include <ext2fs/ext2_fs.h>
 #include <sys/stat.h>
 
-#define BASE_OFFSET 1024 // Offset to the superblock from the start of the disk
+#define BASE_OFFSET 1024                  // Offset to the superblock from the start of the disk
 #define BLOCK_OFFSET(block) (BASE_OFFSET + (block - 1) * block_size)
 
-unsigned int block_size; // Block size initialized from superblock
+unsigned int block_size;                  // Block size initialized from superblock
 
 void read_superblock(int fd, struct ext2_super_block *sb);
 void print_root_entries(int fd, struct ext2_super_block *sb, FILE* output);
@@ -32,7 +32,7 @@ int main(int argc, char *argv[]) {
 
     FILE *output = fopen("root_output.txt", "w");
     if (!output) {
-        perror("Error opening output file");
+        perror("Error opening root output file");
         close(fd);
         exit(EXIT_FAILURE);
     }
@@ -54,24 +54,36 @@ void read_superblock(int fd, struct ext2_super_block *sb) {
         fprintf(stderr, "Failed to read superblock\n");
         exit(EXIT_FAILURE);
     }
-    block_size = 1024 << sb->s_log_block_size; // Calculate block size
+    block_size = 1024 << sb->s_log_block_size;  // Calculate block size dynamically
+    fprintf(stderr, "Calculated block size: %u\n", block_size);
 }
 
 void print_root_entries(int fd, struct ext2_super_block *sb, FILE* output) {
     fprintf(output, "Block size: %u\n", block_size);
     fprintf(output, "Inode size: %u\n", sb->s_inode_size);
 
+    // Locate the first group descriptor just after the superblock
     struct ext2_group_desc gd;
-    lseek(fd, BASE_OFFSET + block_size, SEEK_SET); // Move to the first group descriptor right after the superblock
+    int gd_offset = BASE_OFFSET + (block_size == 1024 ? block_size : 2 * block_size);
+    fprintf(output, "Group descriptor offset: %d\n", gd_offset);
+
+    lseek(fd, gd_offset, SEEK_SET);
     if (read(fd, &gd, sizeof(gd)) != sizeof(gd)) {
         fprintf(output, "Error reading group descriptor\n");
         return;
     }
 
+    if (gd.bg_inode_table == 0) {
+        fprintf(output, "Group descriptor inode table block is zero, which is incorrect.\n");
+        return;
+    }
+
     fprintf(output, "Inode table block: %u\n", gd.bg_inode_table);
+    off_t inode_table_start = BLOCK_OFFSET(gd.bg_inode_table);
+    fprintf(output, "Inode table block start offset: %ld\n", inode_table_start);
 
     struct ext2_inode inode;
-    off_t inode_offset = BLOCK_OFFSET(gd.bg_inode_table) + (EXT2_ROOT_INO - 1) * sb->s_inode_size;
+    off_t inode_offset = inode_table_start + (EXT2_ROOT_INO - 1) * sb->s_inode_size;
     fprintf(output, "Root inode offset: %ld\n", inode_offset);
     lseek(fd, inode_offset, SEEK_SET);
     if (read(fd, &inode, sizeof(struct ext2_inode)) != sizeof(struct ext2_inode)) {
@@ -82,7 +94,6 @@ void print_root_entries(int fd, struct ext2_super_block *sb, FILE* output) {
     fprintf(output, "--Root Directory Entries--\n");
     for (int i = 0; i < EXT2_N_BLOCKS && inode.i_block[i] != 0; i++) {
         fprintf(output, "Root inode block[%d]: %u\n", i, inode.i_block[i]);
-
         unsigned char block[block_size];
         lseek(fd, BLOCK_OFFSET(inode.i_block[i]), SEEK_SET);
         if (read(fd, block, block_size) != block_size) {
@@ -93,30 +104,17 @@ void print_root_entries(int fd, struct ext2_super_block *sb, FILE* output) {
         int offset = 0;
         while (offset < block_size) {
             struct ext2_dir_entry_2 *entry = (struct ext2_dir_entry_2 *)(block + offset);
-
             if (entry->inode != 0 && entry->rec_len >= sizeof(struct ext2_dir_entry_2)) {
-                if (entry->name_len > EXT2_NAME_LEN) {
-                    fprintf(output, "Invalid directory entry: name_len exceeds maximum\n");
-                    break;
-                }
-
                 char name[EXT2_NAME_LEN + 1];
                 memcpy(name, entry->name, entry->name_len);
                 name[entry->name_len] = '\0';
-
-                fprintf(output, "Inode: %u\n", entry->inode);
-                fprintf(output, "Entry Length: %u\n", entry->rec_len);
-                fprintf(output, "Name Length: %u\n", entry->name_len);
-                fprintf(output, "File Type: %u\n", entry->file_type);
-                fprintf(output, "Name: %s\n\n", name);
+                fprintf(output, "Inode: %u, Entry Length: %u, Name Length: %u, File Type: %u, Name: %s\n",
+                        entry->inode, entry->rec_len, entry->name_len, entry->file_type, name);
 
                 offset += entry->rec_len;
             } else {
-                if (entry->rec_len == 0) {
-                    fprintf(output, "Invalid directory entry: rec_len is zero\n");
-                    break;
-                }
-                offset += entry->rec_len;
+                fprintf(output, "Invalid directory entry: rec_len is zero or inode is zero. Stopping parse.\n");
+                break;
             }
         }
     }
